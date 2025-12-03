@@ -18,7 +18,13 @@ const commonAPI = async <T>(httpMethod: HttpMethod, endpoint: string, reqBody: o
         const result = await axios(reqConfig);
         return result.data;
     } catch (err: any) {
-        Object.assign(new Error(err.message), { status: err.status || err.response.status })
+        
+        const message = err.response?.data?.message || err.message || 'Request failed';
+        const status = err.response?.status || err.response?.status || 500;
+
+        const error = new Error(message);
+        (error as any).status = status;
+        throw error;
     }
 }
 

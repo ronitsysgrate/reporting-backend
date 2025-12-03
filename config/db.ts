@@ -38,16 +38,36 @@ const DatabaseExists = async () => {
 const initializeSequelize = async () => {
     // await DatabaseExists();
 
-    const sequelize = new Sequelize(
-        process.env.DB_NAME as string,
-        process.env.DB_USER as string,
-        process.env.DB_PASSWORD as string,
-        {
-            host: process.env.DB_HOST,
-            dialect: 'postgres',
-            logging: false,
-        }
-    )
+    // const sequelize = new Sequelize(
+    //     process.env.DB_NAME as string,
+    //     process.env.DB_USER as string,
+    //     process.env.DB_PASSWORD as string,
+    //     {
+    //         host: process.env.DB_HOST,
+    //         dialect: 'postgres',
+    //         logging: false,
+    //     }
+    // )
+
+    const connectionString = process.env.DATABASE_URL;
+
+    if (!connectionString) {
+        throw new Error('DATABASE_URL is not set in environment variables');
+    }
+
+    const sequelize = new Sequelize(connectionString, {
+        dialect: 'postgres',
+        logging: false,
+        dialectOptions: {
+            ssl: {
+                require: true,
+                rejectUnauthorized: false,
+            },
+        },
+        pool: {
+            max: 5, min: 0, acquire: 30000, idle: 10000
+        },
+    });
 
     try {
         await sequelize.authenticate();

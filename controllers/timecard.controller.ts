@@ -6,7 +6,6 @@ import { getAccessToken } from "../utils/accessToken";
 import { AuthenticatedRequest } from "../middlewares/auth";
 import { fetchUserTimeZone } from "./zoom.controller";
 import { Agent } from "../models/agent.model";
-import { splitDateRange } from "../utils/dateUtils";
 
 export const agentLoginLogoutReport = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
 
@@ -51,7 +50,8 @@ export const agentLoginLogoutReport = async (req: AuthenticatedRequest, res: Res
         });
 
         if (existingData.length === 0 || refresh_record) {
-            await refresh(from, to);
+            const date = to.split('T')[0]
+            await refresh(`${date}T00:00:00Z`, `${date}T23:59:59Z`);
             await refreshAgents()
         }
 
@@ -137,7 +137,8 @@ export const agentStatusDurationReport = async (req: AuthenticatedRequest, res: 
         // Refresh if needed
         const existing = await AgentTimecard.findAll({ where: whereClause, limit: 1 });
         if (existing.length === 0 || refresh_record) {
-            await refresh(from, to);
+            const date = to.split('T')[0]
+            await refresh(`${date}T00:00:00Z`, `${date}T23:59:59Z`);
             await refreshAgents()
         }
 
@@ -182,92 +183,70 @@ export const agentStatusDurationReport = async (req: AuthenticatedRequest, res: 
     }
 };
 
-export const refreshAgentsAPI = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-
-    try {
-        await refreshAgents();
-
-        const agentsData = await fetchAgents();
-
-        if (agentsData) {
-            res.status(200).json({
-                success: true,
-                data: agentsData
-            })
-        }
-    } catch (error) {
-        next(error)
-    }
-}
-
 const refresh = async (from: string, to: string) => {
     try {
         const token = await getAccessToken();
 
         if (!token) throw Object.assign(new Error("Server token missing"), { status: 401 });
+        console.log(from, to);
 
-        const dateRanges = splitDateRange(from, to);
+        await AgentTimecard.destroy({
+            where: {
+                start_time: { [Op.between]: [from, to] },
+            },
+        });
 
-        for (const range of dateRanges) {
-            await AgentTimecard.destroy({
-                where: {
-                    start_time: { [Op.between]: [range.from, range.to] },
-                },
+        let nextPageToken: string | undefined;
+        do {
+            const queryParams = new URLSearchParams({
+                from,
+                to,
+                page_size: '300',
             });
 
-            let nextPageToken: string | undefined;
+            if (nextPageToken) {
+                queryParams.append('next_page_token', nextPageToken);
+            }
 
-            do {
-                const queryParams = new URLSearchParams({
-                    from: range.from,
-                    to: range.to,
-                    page_size: '300',
-                });
+            const response = await commonAPI(
+                "GET",
+                `/contact_center/analytics/dataset/historical/agent_timecard?${queryParams.toString()}`,
+                {},
+                {},
+                token
+            );
 
-                if (nextPageToken) {
-                    queryParams.append('next_page_token', nextPageToken);
+            if (!response || !Array.isArray(response.users)) {
+                throw Object.assign(new Error('API returned invalid data'), { status: 404 });
+            }
+
+            nextPageToken = response.next_page_token;
+
+            if (response?.users?.length > 0) {
+                const validatedData = response.users.map((item: any) => ({
+                    work_session_id: item.work_session_id ?? "",
+                    start_time: item.start_time ?? "",
+                    end_time: item.end_time ?? "",
+                    user_id: item.user_id ?? "",
+                    user_name: item.user_name ?? "",
+                    user_status: item.user_status ?? "",
+                    user_sub_status: item.user_sub_status ?? "",
+                    duration: item.ready_duration || item.occupied_duration || item.not_ready_duration || item.work_session_duration || 0,
+                }));
+
+                try {
+                    await AgentTimecard.bulkCreate(validatedData, {
+                        ignoreDuplicates: true,
+                        validate: true,
+                    });
+                } catch (bulkError) {
+                    console.error('Failed to upsert data in AgentTimecard table:', bulkError);
                 }
+            } else {
+                console.log('No data fetched from API to upsert');
+            }
 
-                const response = await commonAPI(
-                    "GET",
-                    `/contact_center/analytics/dataset/historical/agent_timecard?${queryParams.toString()}`,
-                    {},
-                    {},
-                    token
-                );
-
-                if (!response || !Array.isArray(response.users)) {
-                    throw Object.assign(new Error('API returned invalid data'), { status: 404 });
-                }
-
-                nextPageToken = response.next_page_token;
-
-                if (response?.users?.length > 0) {
-                    const validatedData = response.users.map((item: any) => ({
-                        work_session_id: item.work_session_id ?? "",
-                        start_time: item.start_time ?? "",
-                        end_time: item.end_time ?? "",
-                        user_id: item.user_id ?? "",
-                        user_name: item.user_name ?? "",
-                        user_status: item.user_status ?? "",
-                        user_sub_status: item.user_sub_status ?? "",
-                        duration: item.ready_duration || item.occupied_duration || item.not_ready_duration || item.work_session_duration || 0,
-                    }));
-
-                    try {
-                        await AgentTimecard.bulkCreate(validatedData, {
-                            ignoreDuplicates: true,
-                            validate: true,
-                        });
-                    } catch (bulkError) {
-                        console.error('Failed to upsert data in AgentTimecard table:', bulkError);
-                    }
-                } else {
-                    console.log('No data fetched from API to upsert');
-                }
-
-            } while (nextPageToken);
-        }
+        } while (nextPageToken);
 
     } catch (err) {
         throw err;
@@ -331,15 +310,14 @@ const refreshAgents = async () => {
                     user_id: item.user_id ? item.user_id : ''
                 }));
 
-                try {
-                    await Agent.bulkCreate(validatedData, {
-                        ignoreDuplicates: true,
-                        validate: true,
-                    });
-                } catch (bulkError) {
-                    console.error('Failed to upsert data in AgentPerformance table:', bulkError);
-                }
+                await Agent.destroy({ truncate: true });
 
+                await Agent.bulkCreate(validatedData, {
+                    ignoreDuplicates: true,
+                    validate: true,
+                });
+
+                console.log(`Refreshed ${validatedData.length} agents`);
             } else {
                 console.warn('No data fetched from API to upsert');
             }
